@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ALPACA HYBRID TRADING BOT (Crypto Spot) — Optimized & Relaxed
+# ALPACA HYBRID TRADING BOT (Crypto Spot) — Optimized & Hardened Production Edition
 
 import asyncio
 import pandas as pd
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -143,18 +143,18 @@ def calc_atr(df, period=14):
 class AlpacaTradingBot:
 
     def __init__(self):
-        # CONFIGURATION — Relaxed to give parameters breathing room
-        self.buy_threshold     = 0.65  # Clean signal baseline
-        self.sell_threshold    = 0.35  # Clean signal baseline
-        self.min_hold_bars     = 24    # RELAXED: Hold at least 24 hours to survive noise
+        self.buy_threshold     = 0.65  
+        self.sell_threshold    = 0.35  
+        self.min_hold_bars     = 24    # Hold 24 hours minimum to survive standard noise
         self.sell_confirm_bars = 1
         self.position_size_usd = 100.0  
         self.atr_stop_mult      = 2.0   
-        self.atr_target_mult    = 5.0   # Expanded R:R profile
-        self.daily_loss_limit   = -150.0 # Expanded barrier limit to prevent premature server shutdowns
+        self.atr_target_mult    = 5.0   
+        self.daily_loss_limit   = -150.0 
         self.max_daily_trades   = 10
-        self.cycle_secs         = 3600  # Explicitly defined 1-hour cycle clock
+        self.cycle_secs         = 3600  # Hourly loop interval
 
+        # Symbols listed in standardized format
         self.symbols = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 
         self.api_key    = os.getenv("APCA_API_KEY_ID", "")
@@ -220,7 +220,8 @@ class AlpacaTradingBot:
         try:
             loop = asyncio.get_running_loop()
             positions = await loop.run_in_executor(None, self.trading_client.get_all_positions)
-            return {p.symbol: {'qty': float(p.qty), 'avg_price': float(p.avg_entry_price)} for p in positions}
+            # Normalizing keys returned from Alpaca to ensure strict string matches
+            return {p.symbol.replace('/', ''): {'qty': float(p.qty), 'avg_price': float(p.avg_entry_price)} for p in positions}
         except Exception as e:
             logger.error(f"Position cache error: {e}")
             return {}
@@ -269,7 +270,7 @@ class AlpacaTradingBot:
             else:
                 positions = await self.get_positions_cache()
                 if norm not in positions:
-                    logger.error(f"No position to sell: {symbol}")
+                    logger.error(f"No active execution track found to close: {symbol}")
                     return False, 0, 0
                 qty = round(positions[norm]['qty'] - 0.0000005, 6)
                 if qty <= 0:
@@ -280,15 +281,21 @@ class AlpacaTradingBot:
                 )
 
             order = await loop.run_in_executor(None, self.trading_client.submit_order, order_req)
-
+            
+            # HARDENED FILL DETECTOR: Poll up to 5 seconds to grab actual execution data
             fill_price = pre_price
-            try:
-                if order.filled_avg_price is not None:
-                    fill_price = float(order.filled_avg_price)
-            except Exception:
-                pass
+            for _ in range(5):
+                try:
+                    live_order = await loop.run_in_executor(None, self.trading_client.get_order_by_id, order.id)
+                    if live_order.status == OrderStatus.FILLED and live_order.filled_avg_price is not None:
+                        fill_price = float(live_order.filled_avg_price)
+                        qty = float(live_order.filled_qty) if live_order.filled_qty else qty
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
 
-            logger.info(f"ORDER {side.upper()} {qty} {symbol} @ ~${fill_price:.4f}")
+            logger.info(f"ORDER {side.upper()} {qty} {symbol} Executed @ ${fill_price:.4f}")
             return True, qty, fill_price
 
         except Exception as e:
@@ -297,7 +304,7 @@ class AlpacaTradingBot:
 
     async def run(self):
         logger.info("=" * 60)
-        logger.info("PAPER TRADING — ALPACA HYBRID BOT (Fixed / Hourly Engine)")
+        logger.info("PRODUCTION — ALPACA HYBRID BOT (Fixed / Hourly Engine)")
         logger.info("=" * 60)
 
         last_heartbeat = 0
@@ -324,7 +331,6 @@ class AlpacaTradingBot:
                     await asyncio.sleep(60)
                     continue
 
-                # FIXED: Pull data instantly at loop start instead of forcing a 1-hour delay on boot
                 results = await asyncio.gather(*[self.fetch_data(s) for s in self.symbols])
                 positions_cache = await self.get_positions_cache()
 
@@ -360,12 +366,24 @@ class AlpacaTradingBot:
                             pos_data     = self.positions.get(symbol, {})
                             entry_price  = positions_cache[norm]['avg_price']
                             qty          = positions_cache[norm]['qty']
-                            stop_price   = pos_data.get('stop_price',   entry_price * 0.95)
-                            target_price = pos_data.get('target_price', entry_price * 1.10)
+                            
+                            # BACKSTOP PROTECTION: Calculate dynamic ATR backup targets if state cache was lost
+                            atr_backup   = calc_atr(df, 14)
+                            stop_price   = pos_data.get('stop_price',   entry_price - (atr_backup * self.atr_stop_mult))
+                            target_price = pos_data.get('target_price', entry_price + (atr_backup * self.atr_target_mult))
                             bars_held    = pos_data.get('bars_held',    0)
 
-                            if symbol in self.positions:
-                                self.positions[symbol]['bars_held'] = bars_held + 1
+                            # Re-populate local dictionary parameter tracks if file state went completely missing
+                            if symbol not in self.positions:
+                                self.positions[symbol] = {
+                                    'entry_time':  datetime.now().isoformat(),
+                                    'entry_price': entry_price,
+                                    'stop_price':  stop_price,
+                                    'target_price': target_price,
+                                    'bars_held':    bars_held,
+                                }
+
+                            self.positions[symbol]['bars_held'] = bars_held + 1
 
                             exit_reason = None
                             if price <= stop_price:
@@ -436,7 +454,6 @@ class AlpacaTradingBot:
                     except Exception as e:
                         logger.error(f"{symbol} loop error: {e}")
 
-                # FIXED: The 1-hour sleep sits cleanly at the end of the execution block
                 await asyncio.sleep(self.cycle_secs)
 
             except Exception as e:
