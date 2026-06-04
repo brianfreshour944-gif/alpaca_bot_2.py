@@ -4,13 +4,13 @@ FROM python:3.11-slim
 # Set the working directory inside the container
 WORKDIR /app
 
-# Copy and install dependencies first (utilizes Docker caching)
+# Copy and install dependencies first
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the actual trading script into the container
-COPY alpaca_hybrid_bot.py .
+# COPY THE EXACT FILENAME FROM YOUR REPO:
+COPY alpaca_hybrid_bot_2.py .
 
-# Run the script when the container launches
-CMD ["python", "alpaca_hybrid_bot.py"]
+# RUN THE EXACT FILENAME:
+CMD ["python", "alpaca_hybrid_bot_2.py"]
 
