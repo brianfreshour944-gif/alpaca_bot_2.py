@@ -2,3 +2,5 @@ ccxt
 pandas
 numpy
 alpaca-py
+psycopg2-binary
+python-dotenv
