@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import asyncio
 import pandas as pd
@@ -25,7 +26,6 @@ def log_trade_to_db(bot_name, symbol, side, price, quantity, value, order_id):
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
-                # Matches your existing table: bot_name, exchange, symbol, side, price, quantity, value, order_id, timestamp
                 cur.execute("""
                     INSERT INTO trades (bot_name, exchange, symbol, side, price, quantity, value, order_id, timestamp)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
@@ -34,19 +34,31 @@ def log_trade_to_db(bot_name, symbol, side, price, quantity, value, order_id):
     except Exception as e:
         logger.error(f"Database write error: {e}")
 
-def log_bot_startup(bot_name):
+def check_status(bot_name):
+    """Heartbeat and Kill Switch check for the bot_status table."""
     db_url = os.getenv('DATABASE_URL')
+    if not db_url:
+        return
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO trades (bot_name, exchange, symbol, side, price, quantity, value, order_id, timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                """, (bot_name, 'Alpaca', 'N/A', 'SYSTEM', 0.0, 0.0, 0.0, 'STARTUP_SIGNAL'))
+                # 1. Update Heartbeat
+                cur.execute('''
+                    INSERT INTO bot_status (bot_name, last_update, status)
+                    VALUES (%s, NOW(), 'RUNNING')
+                    ON CONFLICT (bot_name) 
+                    DO UPDATE SET last_update = NOW(), status = EXCLUDED.status;
+                ''', (bot_name,))
+                
+                # 2. Check for Kill Switch
+                cur.execute("SELECT status FROM bot_status WHERE bot_name = %s", (bot_name,))
+                row = cur.fetchone()
+                if row and row[0] == 'STOP':
+                    logger.warning(f"🛑 Kill switch activated for {bot_name}. Shutting down.")
+                    sys.exit(0)
                 conn.commit()
-        logger.info(f"[{bot_name}] Heartbeat: Logged to DB.")
     except Exception as e:
-        logger.error(f"Startup log failed: {e}")
+        logger.error(f"Heartbeat failed: {e}")
 
 # --- BOT CLASS ---
 class AlpacaTradingBot:
@@ -61,19 +73,18 @@ class AlpacaTradingBot:
         self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True)
         self.data_client = CryptoHistoricalDataClient()
         
-        # Log Startup Heartbeat
-        log_bot_startup(self.bot_name)
-        
-        logger.info(f"Bot {self.bot_name} initialized and DB verified.")
+        # Verify status on init
+        check_status(self.bot_name)
+        logger.info(f"Bot {self.bot_name} initialized and DB heartbeat verified.")
 
     async def run(self):
         logger.info("Starting Main Execution Loop...")
         while True:
             try:
-                # ... (Keep your existing trading logic here)
+                # HEARTBEAT & KILL SWITCH CHECK
+                check_status(self.bot_name)
                 
-                # USE THIS FOR TRADES:
-                # log_trade_to_db(self.bot_name, symbol, 'BUY', price, qty, (price*qty), order_id)
+                # ... (Your existing trading logic here)
                 
                 await asyncio.sleep(60)
             except Exception as e:
