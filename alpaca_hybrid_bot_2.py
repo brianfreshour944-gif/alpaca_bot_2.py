@@ -25,22 +25,22 @@ def log_error_to_db(bot_name, error_msg):
     except Exception as e:
         logger.error(f"Failed to log error to DB: {e}")
 
-def log_trade_to_db(bot_name, symbol, side, price, quantity, value, order_id):
+# UPDATED: Added 'fee' parameter
+def log_trade_to_db(bot_name, symbol, side, price, quantity, value, order_id, fee=0.0):
     db_url = os.getenv('DATABASE_URL')
     if not db_url: return
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO trades (bot_name, exchange, symbol, side, price, quantity, value, order_id, timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                """, (bot_name, 'Alpaca', symbol, side, float(price), float(quantity), float(value), str(order_id)))
+                    INSERT INTO trades (bot_name, exchange, symbol, side, price, quantity, value, fee, order_id, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """, (bot_name, 'Alpaca', symbol, side, float(price), float(quantity), float(value), float(fee), str(order_id)))
                 conn.commit()
     except Exception as e:
         logger.error(f"Database write error: {e}")
 
 def register_order_in_db(bot_name, order_id, symbol, side, price):
-    """Registers an open order in the database."""
     db_url = os.getenv('DATABASE_URL')
     if not db_url: return
     try:
@@ -80,17 +80,13 @@ class AlpacaTradingBot:
         self.bot_name = os.getenv('BOT_NAME', 'Alpaca_Bot')
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
-        
         if not os.getenv('DATABASE_URL'):
             raise ValueError("DATABASE_URL not set.")
-            
         self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True)
         self.data_client = CryptoHistoricalDataClient()
-        
         check_status(self.bot_name)
 
     def place_order_tracked(self, symbol, side, qty):
-        """Helper to place order and immediately tag it in DB."""
         order = self.trading_client.submit_order(
             order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.GTC)
         )
@@ -98,7 +94,6 @@ class AlpacaTradingBot:
         return order
 
     async def sync_orders(self):
-        """Check for filled orders and update status in DB."""
         db_url = os.getenv('DATABASE_URL')
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -107,7 +102,8 @@ class AlpacaTradingBot:
                     alpaca_order = self.trading_client.get_order_by_id(oid)
                     if alpaca_order.status == 'filled':
                         cur.execute("UPDATE bot_orders SET status = 'CLOSED' WHERE order_id = %s", (oid,))
-                        log_trade_to_db(self.bot_name, symbol, alpaca_order.side.value, alpaca_order.filled_avg_price, alpaca_order.filled_qty, 0.0, oid)
+                        # Log with 0.0 fee (Alpaca API doesn't provide per-order fee in standard call)
+                        log_trade_to_db(self.bot_name, symbol, alpaca_order.side.value, alpaca_order.filled_avg_price, alpaca_order.filled_qty, (float(alpaca_order.filled_avg_price) * float(alpaca_order.filled_qty)), oid, fee=0.0)
                 conn.commit()
 
     async def run(self):
@@ -116,7 +112,6 @@ class AlpacaTradingBot:
             try:
                 check_status(self.bot_name)
                 await self.sync_orders()
-                # ... (Existing trading logic)
                 await asyncio.sleep(60)
             except Exception as e:
                 error_msg = f"Loop error: {str(e)}"
