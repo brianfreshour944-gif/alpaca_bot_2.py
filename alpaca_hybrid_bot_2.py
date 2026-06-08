@@ -2,36 +2,40 @@
 import asyncio
 import logging
 import os
-import psycopg2
+import time
 import sys
+import psycopg2
+import pandas as pd
+from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from datetime import datetime, timedelta
-import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- DATABASE LOGGING ENGINE ---
+# --- DATABASE LOGGING FUNCTIONS ---
 
 def log_error_to_db(bot_name, error_msg):
     db_url = os.getenv('DATABASE_URL')
-    if not db_url: return
+    if not db_url:
+        return
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO bot_errors (bot_name, error_message) VALUES (%s, %s)", (bot_name, str(error_msg)))
+                cur.execute("INSERT INTO bot_errors (bot_name, error_message) VALUES (%s, %s)",
+                            (bot_name, str(error_msg)))
                 conn.commit()
     except Exception as e:
         logger.error(f"Failed to log error to DB: {e}")
 
 def log_trade_to_db(bot_name, symbol, side, price, quantity, value, order_id, fee=0.0):
     db_url = os.getenv('DATABASE_URL')
-    if not db_url: return
+    if not db_url:
+        return
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -45,7 +49,8 @@ def log_trade_to_db(bot_name, symbol, side, price, quantity, value, order_id, fe
 
 def register_order_in_db(bot_name, order_id, symbol, side, price):
     db_url = os.getenv('DATABASE_URL')
-    if not db_url: return
+    if not db_url:
+        return
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -59,7 +64,8 @@ def register_order_in_db(bot_name, order_id, symbol, side, price):
 
 def check_status(bot_name):
     db_url = os.getenv('DATABASE_URL')
-    if not db_url: return
+    if not db_url:
+        return
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -77,30 +83,31 @@ def check_status(bot_name):
     except Exception as e:
         logger.error(f"Heartbeat failed: {e}")
 
-# --- BOT CLASS WITH TRADING LOGIC ---
+# --- BOT CLASS ---
+
 class AlpacaTradingBot:
     def __init__(self):
-        self.bot_name = os.getenv('BOT_NAME', 'Alpaca_Momentum_Bot')
+        self.bot_name = os.getenv('BOT_NAME', 'alpaca_bot_2.py')  # your original name
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
         if not os.getenv('DATABASE_URL'):
             raise ValueError("DATABASE_URL not set.")
-        
-        self.symbol = "BTC/USD"          # Alpaca crypto symbol format
-        self.timeframe = "15Min"         # 15-minute bars
-        self.trade_size_usd = 10.0       # Amount in USD to risk per trade
+
+        # Trading parameters
+        self.symbol = "BTC/USD"          # Alpaca crypto uses slash format
+        self.trade_size_usd = 10.0       # $10 per trade (paper trading)
         self.in_position = False
         self.entry_price = 0.0
         self.trailing_stop = 0.0
         self.cooldown_until = 0.0
-        
+
         self.trading_client = TradingClient(self.api_key, self.secret_key, paper=True)
         self.data_client = CryptoHistoricalDataClient()
         check_status(self.bot_name)
         logger.info(f"Bot {self.bot_name} initialized. Trading {self.symbol}")
 
     def place_order_tracked(self, symbol, side, qty):
-        """Place a market order and register it in the database."""
+        """Submit market order and log it in the database."""
         order = self.trading_client.submit_order(
             order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.GTC)
         )
@@ -108,12 +115,13 @@ class AlpacaTradingBot:
         return order
 
     async def sync_orders(self):
-        """Sync open orders from the database with Alpaca, mark filled orders as CLOSED."""
+        """Check open orders and mark filled ones as CLOSED."""
         db_url = os.getenv('DATABASE_URL')
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT order_id, symbol FROM bot_orders WHERE bot_name = %s AND status = 'OPEN'", (self.bot_name,))
-                for (oid, symbol) in cur.fetchall():
+                cur.execute("SELECT order_id, symbol FROM bot_orders WHERE bot_name = %s AND status = 'OPEN'",
+                            (self.bot_name,))
+                for oid, symbol in cur.fetchall():
                     try:
                         alpaca_order = self.trading_client.get_order_by_id(oid)
                         if alpaca_order.status == 'filled':
@@ -129,61 +137,58 @@ class AlpacaTradingBot:
                 conn.commit()
 
     async def get_latest_price_and_emas(self):
-        """Fetch the last 50 15-min candles, compute EMAs, return current price, fast_ema, slow_ema, prev_fast, prev_slow."""
-        # Alpaca crypto uses symbols like 'BTC/USD' but request needs 'BTCUSD'
-        request_symbol = self.symbol.replace("/", "")
+        """
+        Fetch recent 15-minute bars, compute EMAs (9 & 21),
+        return (current_price, fast_ema, slow_ema, prev_fast, prev_slow).
+        Returns (None, ...) if insufficient data.
+        """
+        # Alpaca crypto symbol for data is the same as trading: "BTC/USD"
+        request_symbol = self.symbol  # keep slash
+
         end = datetime.now()
-        start = end - timedelta(days=1)   # enough for 50 * 15min = 12.5 hours
+        start = end - timedelta(hours=12)   # enough for ~50 15-min bars
         request = CryptoBarsRequest(
             symbol_or_symbols=request_symbol,
-            timeframe=TimeFrame.Minute,
+            timeframe=TimeFrame.Minute,    # get minute bars, we'll resample to 15m
             start=start,
             end=end,
-            limit=50
+            limit=200                      # plenty of minute bars
         )
         bars = self.data_client.get_crypto_bars(request).data.get(request_symbol, [])
         if not bars or len(bars) < 22:
-            logger.warning(f"Insufficient data: {len(bars)} bars")
+            logger.warning(f"Insufficient minute bars: {len(bars)}")
             return None, None, None, None, None
-        
-        # Convert to DataFrame for easier EMA calculation
-        df = pd.DataFrame([{
-            'timestamp': b.timestamp,
-            'close': float(b.close)
-        } for b in bars])
+
+        # Convert to DataFrame, resample to 15 minutes
+        df = pd.DataFrame([{'timestamp': b.timestamp, 'close': float(b.close)} for b in bars])
         df.sort_values('timestamp', inplace=True)
-        closes = df['close'].values
-        
-        # Resample to 15 minutes (Alpaca returns minute bars, we need 15-min)
-        # Simpler: we can use the last 22 15-min periods by taking every 15th bar
-        # But for simplicity, we'll just take the raw minute closes and compute EMAs on them
-        # However to match 15-min timeframe, we should aggregate. Let's do it properly:
         df.set_index('timestamp', inplace=True)
         ohlc_15 = df.resample('15T').agg({'close': 'last'}).dropna()
-        closes_15 = ohlc_15['close'].values
-        if len(closes_15) < 22:
-            logger.warning(f"Not enough 15-min bars: {len(closes_15)}")
+        closes = ohlc_15['close'].values
+
+        if len(closes) < 22:
+            logger.warning(f"Not enough 15-min bars: {len(closes)}")
             return None, None, None, None, None
-        
-        current_price = closes_15[-1]
-        
-        # Calculate EMAs
+
+        current_price = closes[-1]
+
+        # EMA calculation
         def ema(series, period):
             k = 2 / (period + 1)
             ema_val = series[0]
             for val in series[1:]:
                 ema_val = val * k + ema_val * (1 - k)
             return ema_val
-        
+
         fast_period = 9
         slow_period = 21
-        fast_ema = ema(closes_15[-fast_period:], fast_period)
-        slow_ema = ema(closes_15[-slow_period:], slow_period)
-        
+        fast_ema = ema(closes[-fast_period:], fast_period)
+        slow_ema = ema(closes[-slow_period:], slow_period)
+
         # Previous values for crossover detection
-        prev_fast = ema(closes_15[-fast_period-1:-1], fast_period) if len(closes_15) > fast_period+1 else fast_ema
-        prev_slow = ema(closes_15[-slow_period-1:-1], slow_period) if len(closes_15) > slow_period+1 else slow_ema
-        
+        prev_fast = ema(closes[-fast_period-1:-1], fast_period) if len(closes) > fast_period+1 else fast_ema
+        prev_slow = ema(closes[-slow_period-1:-1], slow_period) if len(closes) > slow_period+1 else slow_ema
+
         return current_price, fast_ema, slow_ema, prev_fast, prev_slow
 
     async def run(self):
@@ -192,65 +197,72 @@ class AlpacaTradingBot:
             try:
                 check_status(self.bot_name)
                 await self.sync_orders()
-                
-                # Cooldown check
+
+                # Cooldown period after a sell
                 if time.time() < self.cooldown_until:
                     logger.info("Cooldown active, skipping trading logic")
                     await asyncio.sleep(60)
                     continue
-                
+
                 # Get market data
-                result = await self.get_latest_price_and_emas()
-                if result[0] is None:
+                data = await self.get_latest_price_and_emas()
+                if data[0] is None:
                     await asyncio.sleep(60)
                     continue
-                
-                current_price, fast_ema, slow_ema, prev_fast, prev_slow = result
+
+                current_price, fast_ema, slow_ema, prev_fast, prev_slow = data
                 logger.info(f"Price: {current_price:.2f} | Fast EMA: {fast_ema:.2f} | Slow EMA: {slow_ema:.2f} | In position: {self.in_position}")
-                
-                # Trading logic
+
+                # --- Trading logic ---
                 if not self.in_position:
-                    # Buy signal: bullish crossover and price above slow EMA
+                    # Buy signal: fast EMA crosses above slow EMA, and price above slow EMA
                     if prev_fast <= prev_slow and fast_ema > slow_ema and current_price > slow_ema:
                         logger.info("*** MOMENTUM BUY SIGNAL ***")
-                        # Calculate quantity based on fixed USD amount
                         qty = self.trade_size_usd / current_price
                         order = self.place_order_tracked(self.symbol, OrderSide.BUY, qty)
                         if order:
                             self.in_position = True
                             self.entry_price = current_price
-                            self.trailing_stop = current_price * 0.97  # 3% trailing stop
+                            self.trailing_stop = current_price * 0.97   # 3% trailing stop
                             logger.info(f"Bought {qty:.6f} {self.symbol} at ~{current_price:.2f}")
+
                 else:
                     # Update trailing stop if price rises
                     if current_price > self.entry_price:
                         self.trailing_stop = max(self.trailing_stop, current_price * 0.97)
-                    
+
                     exit_signal = False
-                    # Sell signal: bearish crossover
+                    # Sell on bearish crossover
                     if fast_ema < slow_ema and prev_fast >= prev_slow:
                         logger.info("*** BEARISH CROSSOVER – SELL ***")
                         exit_signal = True
+                    # Sell on trailing stop hit
                     elif current_price <= self.trailing_stop:
                         logger.info(f"*** TRAILING STOP HIT at {current_price:.2f} ***")
                         exit_signal = True
-                    
+
                     if exit_signal:
-                        # Need to fetch current position quantity
-                        position = self.trading_client.get_position(self.symbol)
-                        qty = float(position.qty)
+                        # Get current position quantity
+                        try:
+                            position = self.trading_client.get_position(self.symbol)
+                            qty = float(position.qty)
+                        except Exception:
+                            qty = 0.0
+                            logger.warning("No open position found, resetting state")
+                            self.in_position = False
+                            continue
+
                         if qty > 0:
                             order = self.place_order_tracked(self.symbol, OrderSide.SELL, qty)
                             if order:
                                 self.in_position = False
-                                self.cooldown_until = asyncio.get_event_loop().time() + 900  # 15 min cooldown
+                                self.cooldown_until = time.time() + 900   # 15 min cooldown
                                 logger.info(f"Sold {qty:.6f} {self.symbol} – momentum exhausted")
                         else:
-                            logger.warning("No position to sell, resetting state")
                             self.in_position = False
-                
+
                 await asyncio.sleep(60)
-                
+
             except Exception as e:
                 error_msg = f"Loop error: {str(e)}"
                 logger.error(error_msg)
@@ -258,7 +270,6 @@ class AlpacaTradingBot:
                 await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    import time  # for cooldown time.time() usage
     try:
         bot = AlpacaTradingBot()
         asyncio.run(bot.run())
