@@ -137,59 +137,57 @@ class AlpacaTradingBot:
                 conn.commit()
 
     async def get_latest_price_and_emas(self):
-        """
-        Fetch recent 15-minute bars, compute EMAs (9 & 21),
-        return (current_price, fast_ema, slow_ema, prev_fast, prev_slow).
-        Returns (None, ...) if insufficient data.
-        """
-        # Alpaca crypto symbol for data is the same as trading: "BTC/USD"
-        request_symbol = self.symbol  # keep slash
+    """
+    Fetch recent 15-minute bars, compute EMAs (9 & 21),
+    return (current_price, fast_ema, slow_ema, prev_fast, prev_slow).
+    Returns (None, ...) if insufficient data.
+    """
+    request_symbol = self.symbol  # keep slash
 
-        end = datetime.now()
-        start = end - timedelta(hours=12)   # enough for ~50 15-min bars
-        request = CryptoBarsRequest(
-            symbol_or_symbols=request_symbol,
-            timeframe=TimeFrame.Minute,    # get minute bars, we'll resample to 15m
-            start=start,
-            end=end,
-            limit=200                      # plenty of minute bars
-        )
-        bars = self.data_client.get_crypto_bars(request).data.get(request_symbol, [])
-        if not bars or len(bars) < 22:
-            logger.warning(f"Insufficient minute bars: {len(bars)}")
-            return None, None, None, None, None
+    end = datetime.now()
+    start = end - timedelta(hours=12)
+    request = CryptoBarsRequest(
+        symbol_or_symbols=request_symbol,
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        limit=200
+    )
+    bars = self.data_client.get_crypto_bars(request).data.get(request_symbol, [])
+    if not bars or len(bars) < 22:
+        logger.warning(f"Insufficient minute bars: {len(bars)}")
+        return None, None, None, None, None
 
-        # Convert to DataFrame, resample to 15 minutes
-        df = pd.DataFrame([{'timestamp': b.timestamp, 'close': float(b.close)} for b in bars])
-        df.sort_values('timestamp', inplace=True)
-        df.set_index('timestamp', inplace=True)
-        ohlc_15 = df.resample('15T').agg({'close': 'last'}).dropna()
-        closes = ohlc_15['close'].values
+    df = pd.DataFrame([{'timestamp': b.timestamp, 'close': float(b.close)} for b in bars])
+    df.sort_values('timestamp', inplace=True)
+    df.set_index('timestamp', inplace=True)
+    
+    # FIX: use '15min' instead of '15T'
+    ohlc_15 = df.resample('15min').agg({'close': 'last'}).dropna()
+    closes = ohlc_15['close'].values
 
-        if len(closes) < 22:
-            logger.warning(f"Not enough 15-min bars: {len(closes)}")
-            return None, None, None, None, None
+    if len(closes) < 22:
+        logger.warning(f"Not enough 15-min bars: {len(closes)}")
+        return None, None, None, None, None
 
-        current_price = closes[-1]
+    current_price = closes[-1]
 
-        # EMA calculation
-        def ema(series, period):
-            k = 2 / (period + 1)
-            ema_val = series[0]
-            for val in series[1:]:
-                ema_val = val * k + ema_val * (1 - k)
-            return ema_val
+    def ema(series, period):
+        k = 2 / (period + 1)
+        ema_val = series[0]
+        for val in series[1:]:
+            ema_val = val * k + ema_val * (1 - k)
+        return ema_val
 
-        fast_period = 9
-        slow_period = 21
-        fast_ema = ema(closes[-fast_period:], fast_period)
-        slow_ema = ema(closes[-slow_period:], slow_period)
+    fast_period = 9
+    slow_period = 21
+    fast_ema = ema(closes[-fast_period:], fast_period)
+    slow_ema = ema(closes[-slow_period:], slow_period)
 
-        # Previous values for crossover detection
-        prev_fast = ema(closes[-fast_period-1:-1], fast_period) if len(closes) > fast_period+1 else fast_ema
-        prev_slow = ema(closes[-slow_period-1:-1], slow_period) if len(closes) > slow_period+1 else slow_ema
+    prev_fast = ema(closes[-fast_period-1:-1], fast_period) if len(closes) > fast_period+1 else fast_ema
+    prev_slow = ema(closes[-slow_period-1:-1], slow_period) if len(closes) > slow_period+1 else slow_ema
 
-        return current_price, fast_ema, slow_ema, prev_fast, prev_slow
+    return current_price, fast_ema, slow_ema, prev_fast, prev_slow
 
     async def run(self):
         logger.info("Starting Main Execution Loop...")
