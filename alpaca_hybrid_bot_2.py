@@ -143,29 +143,33 @@ class AlpacaTradingBot:
         request_symbol = self.symbol
 
         end = datetime.now()
-        start = end - timedelta(hours=12)
+        start = end - timedelta(hours=24)          # 24 hours of minute bars
         request = CryptoBarsRequest(
             symbol_or_symbols=request_symbol,
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
-            limit=200
+            limit=500                               # plenty of minute bars
         )
         bars = self.data_client.get_crypto_bars(request).data.get(request_symbol, [])
-        if not bars or len(bars) < 22:
+        if not bars or len(bars) < 200:            # need enough minute bars for 22*15=330 minutes
             logger.warning(f"Insufficient minute bars: {len(bars)}")
             return None, None, None, None, None
 
+        # Convert to DataFrame and resample to 15 minutes
         df = pd.DataFrame([{'timestamp': b.timestamp, 'close': float(b.close)} for b in bars])
         df.sort_values('timestamp', inplace=True)
         df.set_index('timestamp', inplace=True)
 
-        # Resample to 15 minutes
+        # Alpaca timestamps are timezone-aware (UTC); make them naive to avoid pandas warnings
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
         ohlc_15 = df.resample('15min').agg({'close': 'last'}).dropna()
         closes = ohlc_15['close'].values
 
         if len(closes) < 22:
-            logger.warning(f"Not enough 15-min bars: {len(closes)}")
+            logger.warning(f"Not enough 15-min bars: {len(closes)} (need 22)")
             return None, None, None, None, None
 
         current_price = closes[-1]
