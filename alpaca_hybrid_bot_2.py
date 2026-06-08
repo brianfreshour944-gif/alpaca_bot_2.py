@@ -87,15 +87,15 @@ def check_status(bot_name):
 
 class AlpacaTradingBot:
     def __init__(self):
-        self.bot_name = os.getenv('BOT_NAME', 'alpaca_bot_2.py')  # your original name
+        self.bot_name = os.getenv('BOT_NAME', 'alpaca_bot_2.py')
         self.api_key = os.getenv("APCA_API_KEY_ID", "")
         self.secret_key = os.getenv("APCA_API_SECRET_KEY", "")
         if not os.getenv('DATABASE_URL'):
             raise ValueError("DATABASE_URL not set.")
 
         # Trading parameters
-        self.symbol = "BTC/USD"          # Alpaca crypto uses slash format
-        self.trade_size_usd = 10.0       # $10 per trade (paper trading)
+        self.symbol = "BTC/USD"
+        self.trade_size_usd = 10.0
         self.in_position = False
         self.entry_price = 0.0
         self.trailing_stop = 0.0
@@ -107,7 +107,6 @@ class AlpacaTradingBot:
         logger.info(f"Bot {self.bot_name} initialized. Trading {self.symbol}")
 
     def place_order_tracked(self, symbol, side, qty):
-        """Submit market order and log it in the database."""
         order = self.trading_client.submit_order(
             order_data=MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.GTC)
         )
@@ -115,7 +114,6 @@ class AlpacaTradingBot:
         return order
 
     async def sync_orders(self):
-        """Check open orders and mark filled ones as CLOSED."""
         db_url = os.getenv('DATABASE_URL')
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -137,57 +135,57 @@ class AlpacaTradingBot:
                 conn.commit()
 
     async def get_latest_price_and_emas(self):
-    """
-    Fetch recent 15-minute bars, compute EMAs (9 & 21),
-    return (current_price, fast_ema, slow_ema, prev_fast, prev_slow).
-    Returns (None, ...) if insufficient data.
-    """
-    request_symbol = self.symbol  # keep slash
+        """
+        Fetch recent 15-minute bars, compute EMAs (9 & 21),
+        return (current_price, fast_ema, slow_ema, prev_fast, prev_slow).
+        Returns (None, ...) if insufficient data.
+        """
+        request_symbol = self.symbol
 
-    end = datetime.now()
-    start = end - timedelta(hours=12)
-    request = CryptoBarsRequest(
-        symbol_or_symbols=request_symbol,
-        timeframe=TimeFrame.Minute,
-        start=start,
-        end=end,
-        limit=200
-    )
-    bars = self.data_client.get_crypto_bars(request).data.get(request_symbol, [])
-    if not bars or len(bars) < 22:
-        logger.warning(f"Insufficient minute bars: {len(bars)}")
-        return None, None, None, None, None
+        end = datetime.now()
+        start = end - timedelta(hours=12)
+        request = CryptoBarsRequest(
+            symbol_or_symbols=request_symbol,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            limit=200
+        )
+        bars = self.data_client.get_crypto_bars(request).data.get(request_symbol, [])
+        if not bars or len(bars) < 22:
+            logger.warning(f"Insufficient minute bars: {len(bars)}")
+            return None, None, None, None, None
 
-    df = pd.DataFrame([{'timestamp': b.timestamp, 'close': float(b.close)} for b in bars])
-    df.sort_values('timestamp', inplace=True)
-    df.set_index('timestamp', inplace=True)
-    
-    # FIX: use '15min' instead of '15T'
-    ohlc_15 = df.resample('15min').agg({'close': 'last'}).dropna()
-    closes = ohlc_15['close'].values
+        df = pd.DataFrame([{'timestamp': b.timestamp, 'close': float(b.close)} for b in bars])
+        df.sort_values('timestamp', inplace=True)
+        df.set_index('timestamp', inplace=True)
 
-    if len(closes) < 22:
-        logger.warning(f"Not enough 15-min bars: {len(closes)}")
-        return None, None, None, None, None
+        # Resample to 15 minutes
+        ohlc_15 = df.resample('15min').agg({'close': 'last'}).dropna()
+        closes = ohlc_15['close'].values
 
-    current_price = closes[-1]
+        if len(closes) < 22:
+            logger.warning(f"Not enough 15-min bars: {len(closes)}")
+            return None, None, None, None, None
 
-    def ema(series, period):
-        k = 2 / (period + 1)
-        ema_val = series[0]
-        for val in series[1:]:
-            ema_val = val * k + ema_val * (1 - k)
-        return ema_val
+        current_price = closes[-1]
 
-    fast_period = 9
-    slow_period = 21
-    fast_ema = ema(closes[-fast_period:], fast_period)
-    slow_ema = ema(closes[-slow_period:], slow_period)
+        def ema(series, period):
+            k = 2 / (period + 1)
+            ema_val = series[0]
+            for val in series[1:]:
+                ema_val = val * k + ema_val * (1 - k)
+            return ema_val
 
-    prev_fast = ema(closes[-fast_period-1:-1], fast_period) if len(closes) > fast_period+1 else fast_ema
-    prev_slow = ema(closes[-slow_period-1:-1], slow_period) if len(closes) > slow_period+1 else slow_ema
+        fast_period = 9
+        slow_period = 21
+        fast_ema = ema(closes[-fast_period:], fast_period)
+        slow_ema = ema(closes[-slow_period:], slow_period)
 
-    return current_price, fast_ema, slow_ema, prev_fast, prev_slow
+        prev_fast = ema(closes[-fast_period-1:-1], fast_period) if len(closes) > fast_period+1 else fast_ema
+        prev_slow = ema(closes[-slow_period-1:-1], slow_period) if len(closes) > slow_period+1 else slow_ema
+
+        return current_price, fast_ema, slow_ema, prev_fast, prev_slow
 
     async def run(self):
         logger.info("Starting Main Execution Loop...")
@@ -196,13 +194,11 @@ class AlpacaTradingBot:
                 check_status(self.bot_name)
                 await self.sync_orders()
 
-                # Cooldown period after a sell
                 if time.time() < self.cooldown_until:
                     logger.info("Cooldown active, skipping trading logic")
                     await asyncio.sleep(60)
                     continue
 
-                # Get market data
                 data = await self.get_latest_price_and_emas()
                 if data[0] is None:
                     await asyncio.sleep(60)
@@ -211,9 +207,7 @@ class AlpacaTradingBot:
                 current_price, fast_ema, slow_ema, prev_fast, prev_slow = data
                 logger.info(f"Price: {current_price:.2f} | Fast EMA: {fast_ema:.2f} | Slow EMA: {slow_ema:.2f} | In position: {self.in_position}")
 
-                # --- Trading logic ---
                 if not self.in_position:
-                    # Buy signal: fast EMA crosses above slow EMA, and price above slow EMA
                     if prev_fast <= prev_slow and fast_ema > slow_ema and current_price > slow_ema:
                         logger.info("*** MOMENTUM BUY SIGNAL ***")
                         qty = self.trade_size_usd / current_price
@@ -221,26 +215,21 @@ class AlpacaTradingBot:
                         if order:
                             self.in_position = True
                             self.entry_price = current_price
-                            self.trailing_stop = current_price * 0.97   # 3% trailing stop
+                            self.trailing_stop = current_price * 0.97
                             logger.info(f"Bought {qty:.6f} {self.symbol} at ~{current_price:.2f}")
-
                 else:
-                    # Update trailing stop if price rises
                     if current_price > self.entry_price:
                         self.trailing_stop = max(self.trailing_stop, current_price * 0.97)
 
                     exit_signal = False
-                    # Sell on bearish crossover
                     if fast_ema < slow_ema and prev_fast >= prev_slow:
                         logger.info("*** BEARISH CROSSOVER – SELL ***")
                         exit_signal = True
-                    # Sell on trailing stop hit
                     elif current_price <= self.trailing_stop:
                         logger.info(f"*** TRAILING STOP HIT at {current_price:.2f} ***")
                         exit_signal = True
 
                     if exit_signal:
-                        # Get current position quantity
                         try:
                             position = self.trading_client.get_position(self.symbol)
                             qty = float(position.qty)
@@ -254,7 +243,7 @@ class AlpacaTradingBot:
                             order = self.place_order_tracked(self.symbol, OrderSide.SELL, qty)
                             if order:
                                 self.in_position = False
-                                self.cooldown_until = time.time() + 900   # 15 min cooldown
+                                self.cooldown_until = time.time() + 900
                                 logger.info(f"Sold {qty:.6f} {self.symbol} – momentum exhausted")
                         else:
                             self.in_position = False
